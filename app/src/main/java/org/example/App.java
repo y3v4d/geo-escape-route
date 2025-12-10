@@ -3,12 +3,436 @@
  */
 package org.example;
 
+import java.io.File;
+import java.io.FileInputStream;
+import java.net.URLEncoder;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+import org.jgrapht.Graph;
+import org.jgrapht.alg.shortestpath.DijkstraShortestPath;
+import org.jgrapht.graph.DefaultWeightedEdge;
+import org.jgrapht.graph.SimpleWeightedGraph;
+import org.jspecify.annotations.NonNull;
+
+import com.mapbox.geojson.Feature;
+import com.mapbox.geojson.FeatureCollection;
+import com.mapbox.geojson.GeoJson;
+import com.mapbox.geojson.LineString;
+import com.mapbox.geojson.MultiPolygon;
+import com.mapbox.geojson.Point;
+import com.mapbox.geojson.Polygon;
+
 public class App {
-    public String getGreeting() {
-        return "Hello World!";
+    public static void main(String[] args) throws Exception {
+        String content = loadFile("krosno.geojson");
+        String floodMapContent = loadFile("flood_map.geojson");
+
+        FeatureCollection geoJson = FeatureCollection.fromJson(content);
+        assert geoJson != null;
+        System.out.println("Is Valid: " + (geoJson != null && !geoJson.features().isEmpty()));
+
+        FeatureCollection floodMapGeoJson = FeatureCollection.fromJson(floodMapContent);
+        assert floodMapGeoJson != null;
+        System.out.println("Flood Map Is Valid: " + (floodMapGeoJson != null && !floodMapGeoJson.features().isEmpty()));
+
+        List<Polygon> floodZones = new ArrayList<>();
+        floodMapGeoJson.features().forEach(feature -> {
+            if(feature.geometry() instanceof Polygon polygon) {
+                floodZones.add(polygon);
+            } else if(feature.geometry() instanceof MultiPolygon multiPolygon) {
+                floodZones.addAll(multiPolygon.polygons());
+            }
+        });
+
+        System.out.println("Loaded " + floodZones.size() + " flood zones.");
+
+        List<LineString> roadLines = new ArrayList<>();
+        geoJson.features().forEach(feature -> {
+            if(feature.geometry() instanceof LineString route) {
+                roadLines.add(route);
+            }
+        });
+
+        SimpleWeightedGraph<Point, @NonNull DefaultWeightedEdge> graph = new SimpleWeightedGraph<>(DefaultWeightedEdge.class);
+        roadLines.forEach(route -> {
+            //System.out.println("Processing route " +  feature.id() + " with " + route.coordinates().size() + " points.");
+            Point prevPoint = null;
+            for(Point coord : route.coordinates()) {
+                if(isPointInFloodZone(coord, floodZones)) {
+                    System.out.println("Point " + coord + " is inside flood zone. Skipping.");
+                    prevPoint = null;
+                    continue;
+                }
+
+                graph.addVertex(coord);
+
+                if(prevPoint != null) {
+                    boolean isInFloodZone = isLineGoingThroughFloodZone(prevPoint, coord, floodZones);
+                    if(isInFloodZone) {
+                        System.out.println("Edge from " + prevPoint + " to " + coord + " goes through flood zone. Skipping...");
+                        prevPoint = coord;
+
+                        continue;
+                    }
+
+                    DefaultWeightedEdge edge = graph.addEdge(prevPoint, coord);
+                    double distance = haversineDistance(
+                        prevPoint.latitude(), prevPoint.longitude(),
+                        coord.latitude(), coord.longitude()
+                    );
+                    
+                    graph.setEdgeWeight(edge, distance);
+                }
+
+                prevPoint = coord;
+            }
+        });
+
+        // Extract all edges and convert to lines geojson
+        {
+            List<Feature> edgeFeatures = new ArrayList<>();
+            for(DefaultWeightedEdge edge : graph.edgeSet()) {
+                Point source = graph.getEdgeSource(edge);
+                Point target = graph.getEdgeTarget(edge);
+                LineString line = LineString.fromLngLats(List.of(source, target));
+                var lineFeature = Feature.fromGeometry(line);
+                lineFeature.addNumberProperty("weight", graph.getEdgeWeight(edge));
+                edgeFeatures.add(lineFeature);
+            }
+
+            var edgesFeatureCollection = FeatureCollection.fromFeatures(edgeFeatures);
+            File edgesOutputFile = new File("all-edges.geojson");
+            try (var writer = new java.io.FileWriter(edgesOutputFile)) {
+                writer.write(edgesFeatureCollection.toJson());
+            }
+            System.out.println("All edges saved to " + edgesOutputFile.getAbsolutePath());
+        }
+
+        { // Convert all nodes to points and save to geojson file
+            Map<String, List<Point>> points = new HashMap<>();
+            geoJson.features().forEach(feature -> {
+                if(feature.geometry() instanceof LineString route) {
+                    List<Point> routePoints = new ArrayList<>(route.coordinates());
+                    points.put(feature.id() != null ? feature.id() : "unknown", routePoints);
+                }
+            });
+
+            List<Feature> pointFeatures = new ArrayList<>();
+            for(var entry : points.entrySet()) {
+                for(Point p : entry.getValue()) {
+                    var pointFeature = Feature.fromGeometry(p);
+                    pointFeature.addStringProperty("route_id", entry.getKey());
+                    pointFeatures.add(pointFeature);
+                }
+            }
+
+            var pointsFeatureCollection = FeatureCollection.fromFeatures(pointFeatures);
+            File pointsOutputFile = new File("all-points.geojson");
+            try (var writer = new java.io.FileWriter(pointsOutputFile)) {
+                writer.write(pointsFeatureCollection.toJson());
+            }
+            System.out.println("All points saved to " + pointsOutputFile.getAbsolutePath());
+        }
+
+        System.out.println("Graph vertices count: " + graph.vertexSet().size());
+        System.out.println("Graph edges count: " + graph.edgeSet().size());
+
+        Point start = Point.fromLngLat(21.7643873, 49.6833371);
+        Point end = Point.fromLngLat(21.7602742, 49.6853010);
+
+        Point nearestStart = findNearestPoint(graph, start, 0.05);
+        if(nearestStart == null) {
+            System.out.println("No nearby start point found within 50 meters.");
+            return;
+        }
+        Point nearestEnd = findNearestPoint(graph, end, 0.05);
+        if(nearestEnd == null) {
+            System.out.println("No nearby end point found within 50 meters.");
+            return;
+        }
+
+        System.out.println("Nearest start point: " + nearestStart);
+        System.out.println("Nearest end point: " + nearestEnd);
+        System.out.println("Has point in graph: " + graph.containsVertex(nearestStart) + ", " + graph.containsVertex(nearestEnd));
+
+        DijkstraShortestPath<Point, @NonNull DefaultWeightedEdge> dijkstraAlg = new DijkstraShortestPath<>(graph);
+        var path = dijkstraAlg.getPath(nearestStart, nearestEnd);
+        if(path != null) {
+            System.out.println("Shortest path distance: " + path.getWeight() + " km");
+            System.out.println("Shortest path: " + path.getVertexList());
+        } else {
+            System.out.println("No path found between the points.");
+        }
+
+        // save the path to geojson
+        var pathCoordinates = path.getVertexList();
+        LineString pathLineString = LineString.fromLngLats(pathCoordinates);
+        var pathFeature = Feature.fromGeometry(pathLineString);
+        var pathFeatureCollection = FeatureCollection.fromFeature(pathFeature);
+        File outputGeoJsonFile = new File("shortest-path.geojson");
+        try (var writer = new java.io.FileWriter(outputGeoJsonFile)) {
+            writer.write(pathFeatureCollection.toJson());
+        }
+
+        System.out.println("Shortest path saved to " + outputGeoJsonFile.getAbsolutePath());
+        var finalGeojson = generateFinalGeoJson(roadLines, floodZones, pathCoordinates);
+        
+        String geojsonIOURL = generateGeojsonIOURL(finalGeojson);
+        //System.out.println("View the path at: " + geojsonIOURL);
+
+        System.out.println("Opening the result in geojson.io...");
+        openWithBrowser(geojsonIOURL);
+
+        /*ObjectMapper mapper = new ObjectMapper();
+        GeoJson geoJson = mapper.readValue(content, GeoJson.class);
+        System.out.println("Is Valid:" + geoJson.isValid());*/
+
+        /*String body = 
+        """
+            {
+                "input": {
+                    "bounds": {
+                    "bbox": [
+                        21.757916,
+                        49.689899,
+                        21.772246,
+                        49.697949
+                    ]
+                    },
+                    "data": [
+                    {
+                        "dataFilter": {
+                        "timeRange": {
+                            "from": "2025-11-08T00:00:00Z",
+                            "to": "2025-12-08T23:59:59Z"
+                        }
+                        },
+                        "type": "sentinel-1-grd"
+                    }
+                    ]
+                },
+                "output": {
+                    "width": 512,
+                    "height": 444.597,
+                    "responses": [
+                    {
+                        "identifier": "default",
+                        "format": {
+                        "type": "image/tiff"
+                        }
+                    }
+                    ]
+                },
+                "evalscript": "function setup() { return { input: ['VH'], output: { bands: 3, sampleType: 'AUTO' } };}function evaluatePixel(sample) { var VH = sample.VH; var VH_dB = 10 * Math.log10(VH); var floodThreshold = -21; if (VH_dB < floodThreshold) { return [0, 0, 1]; } else { var min_dB = -25; var max_dB = -5; var normVal = (VH_dB - min_dB) / (max_dB - min_dB); normVal = Math.max(0, Math.min(1, normVal)); return [normVal, normVal, normVal]; }}"
+            }
+        """;
+
+        System.out.println("Request body: " + body);
+
+        byte[] res = httpHelper.post(
+            "https://services.sentinel-hub.com/api/v1/process", 
+            body,
+            Map.of(
+                "Content-Type", "application/json",
+                "Authorization", "Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6IncxWjNSSGNyWjVVMGFQWXhNX1hscCJ9.eyJlbWFpbCI6InkzdjRkQHByb3Rvbi5tZSIsImFwaV9rZXkiOiJQTEFLNTgyNzBjNjBlOTAzNDg1ZmE3MGZmMDQwOTJlMmIzOTkiLCJvcmdhbml6YXRpb25faWQiOjc4ODg5OSwicGxfcHJpbmNpcGFsIjoicHJuOmFkbWluOnByaW5jaXBhbDp1c2VyOjgyMTIwMSIsInJvbGVfbGV2ZWwiOjEwMDAsInNoX3VzZXJfaWQiOiI4NzdmMzYwOC00N2ZhLTQwNGItODBjOS1hZWY5NjUzYjg0NTEiLCJ1c2VyX2lkIjo4MjEyMDEsImFjY291bnQiOiIyNjI5ZDA4Yi0yNzIxLTQ5YjYtYjdhNS1kNDAyYTVlMGYwY2IiLCJwbF9wcm9qZWN0IjoiMjYyOWQwOGItMjcyMS00OWI2LWI3YTUtZDQwMmE1ZTBmMGNiIiwicGxfcHJvamVjdF9yb2xlIjoxMDAwLCJwbF93b3Jrc3BhY2UiOiIwMDFjNDhiOS04OTQyLTRhOGQtYmNiOS1hM2ZkYmY1MTllODIiLCJwbF93b3Jrc3BhY2Vfcm9sZSI6MTAwMCwicGxfY3VzdG9tZXJfYWNjb3VudCI6ImNhYTJmYjZhLTE4OWItNDQxYS1hZWU5LTZhMjc1YjY4NmZiZCIsInBsX2N1c3RvbWVyX2FjY291bnRfcm9sZSI6MTAwMCwiY2lkIjoibDJ4OGp6OWJDbDI1RW9ndkhxNWEwNHltQVowNFVDVjgiLCJpc3MiOiJodHRwczovL2xvZ2luLnBsYW5ldC5jb20vIiwic3ViIjoiYXV0aDB8cGxhbmV0LXVzZXItZGJ8ODIxMjAxIiwiYXVkIjpbImh0dHBzOi8vYXBpLnBsYW5ldC5jb20vIiwiaHR0cHM6Ly9wbGFuZXQtZWRwLXByb2QtMS51cy5hdXRoMC5jb20vdXNlcmluZm8iXSwiaWF0IjoxNzY1MjIxMTkyLCJleHAiOjE3NjUyMjk3OTIsInNjb3BlIjoib3BlbmlkIHByb2ZpbGUgZW1haWwiLCJhenAiOiJsMng4ano5YkNsMjVFb2d2SHE1YTA0eW1BWjA0VUNWOCJ9.QRGqjUZ_kXqS3XemAqO7vIFbA5tibE7TLolQUBaoghoaK77Z3wsIzbdqOpCw22zKKqgE8iy_B1o1IBQN6b_bNVAvFRILdZSAWcuqN3Juis50z13TOA6ntqz7dxiMKbmoK9X7LZNr2i6ZlGFKhxQk1qD7MBK_nQqiQINTSaXXtdo9K_o-FfOsbp_WHEmyVEGVt7BW3XrdbC3Pce9nWR8zLJQOCLtiQi2d9Qi4Ick0kCjYFiPAMjVS71HB1fIOrauif-xpguSJZh3ZilS23nHczLCZFyJfRTq_y0H54jpp8V7L_hkAAW6L0dDQC3SyK1MGQuKX2t_KfCQBfNDUZ8VfOw"
+            )
+        );
+
+        String responseData = new String(res);
+
+        System.out.println("Response length: " + res.length);
+        System.out.println("Response data: " + responseData);*/
     }
 
-    public static void main(String[] args) {
-        System.out.println(new App().getGreeting());
+    private static void openWithBrowser(String url) throws Exception {
+        if (java.awt.Desktop.isDesktopSupported()) {
+            java.awt.Desktop desktop = java.awt.Desktop.getDesktop();
+            desktop.browse(new java.net.URI(url));
+        } else {
+            System.out.println("Desktop is not supported.");
+        }
+    }
+
+    private static String loadFile(String path) throws Exception {
+        FileInputStream fs = new FileInputStream(path);
+        byte[] data = fs.readAllBytes();
+        fs.close();
+
+        return new String(data);
+    }
+
+    private static FeatureCollection generateFinalGeoJson(@NonNull List<LineString> lines, @NonNull List<Polygon> floodZones, @NonNull List<Point> path) {
+        List<Feature> features = new ArrayList<>();
+
+        // Add road lines
+        for (LineString line : lines) {
+            Feature roadFeature = Feature.fromGeometry(line);
+            roadFeature.addStringProperty("type", "road");
+            roadFeature.addStringProperty("stroke", "#3887be");
+            roadFeature.addNumberProperty("stroke-width", 2);
+            features.add(roadFeature);
+        }
+
+        // Add flood zones
+        for (Polygon floodZone : floodZones) {
+            Feature floodFeature = Feature.fromGeometry(floodZone);
+            floodFeature.addStringProperty("type", "flood_zone");
+            floodFeature.addStringProperty("fill", "#e55e5e");
+            floodFeature.addNumberProperty("fill-opacity", 0.5);
+            floodFeature.addStringProperty("stroke", "#e55e5e");
+            floodFeature.addNumberProperty("stroke-width", 1);
+            features.add(floodFeature);
+        }
+
+        // Add path as a line
+        if (path.size() > 1) {
+            LineString pathLine = LineString.fromLngLats(path);
+            Feature pathFeature = Feature.fromGeometry(pathLine);
+            pathFeature.addStringProperty("type", "escape_path");
+            pathFeature.addStringProperty("stroke", "#00ff00");
+            pathFeature.addNumberProperty("stroke-width", 4);
+            features.add(pathFeature);
+        }
+
+        // Add starting and ending points
+        if (!path.isEmpty()) {
+            Feature startPointFeature = Feature.fromGeometry(path.get(0));
+            startPointFeature.addStringProperty("type", "start_point");
+            startPointFeature.addStringProperty("marker-color", "#00ff00");
+            features.add(startPointFeature);
+
+            Feature endPointFeature = Feature.fromGeometry(path.get(path.size() - 1));
+            endPointFeature.addStringProperty("type", "end_point");
+            endPointFeature.addStringProperty("marker-color", "#ff0000");
+            features.add(endPointFeature);
+        }
+
+        FeatureCollection collection = FeatureCollection.fromFeatures(features);
+        return collection;
+    }
+
+    private static String generateGeojsonIOURL(FeatureCollection featureCollection) {
+        // Upload the geojson to geojson.io and return the URL
+        try {
+            String geojsonData = featureCollection.toJson();
+            String encodedGeojson = URLEncoder.encode(geojsonData, java.nio.charset.StandardCharsets.UTF_8);
+            String url = "http://geojson.io/#data=data:application/json," + encodedGeojson;
+            return url;
+        } catch (Exception e) {
+            e.printStackTrace();
+            return null;
+        }
+    }
+
+    private static boolean isLineGoingThroughPolygon(Point start, Point end, Polygon polygon) {
+        List<List<Point>> coordinates = polygon.coordinates();
+        if (coordinates.isEmpty()) {
+            return false;
+        }
+
+        List<Point> outerRing = coordinates.get(0);
+        int n = outerRing.size();
+        for (int i = 0, j = n - 1; i < n; j = i++) {
+            Point p1 = outerRing.get(i);
+            Point p2 = outerRing.get(j);
+
+            if (doLinesIntersect(start, end, p1, p2)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static boolean doLinesIntersect(Point p1, Point p2, Point q1, Point q2) {
+        double d1 = (p2.longitude() - p1.longitude()) * (q1.latitude() - p1.latitude()) - (p2.latitude() - p1.latitude()) * (q1.longitude() - p1.longitude());
+        double d2 = (p2.longitude() - p1.longitude()) * (q2.latitude() - p1.latitude()) - (p2.latitude() - p1.latitude()) * (q2.longitude() - p1.longitude());
+        double d3 = (q2.longitude() - q1.longitude()) * (p1.latitude() - q1.latitude()) - (q2.latitude() - q1.latitude()) * (p1.longitude() - q1.longitude());
+        double d4 = (q2.longitude() - q1.longitude()) * (p2.latitude() - q1.latitude()) - (q2.latitude() - q1.latitude()) * (p2.longitude() - q1.longitude());
+
+        return (d1 * d2 < 0) && (d3 * d4 < 0);
+    }
+
+    private static boolean isPointInFloodZone(Point point, List<Polygon> floodZones) {
+        for (Polygon floodZone : floodZones) {
+            if (isPointInPolygon(point, floodZone)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isLineGoingThroughFloodZone(Point start, Point end, List<Polygon> floodZones) {
+        for (Polygon floodZone : floodZones) {
+            if (isLineGoingThroughPolygon(start, end, floodZone)) {
+                return true;
+            }
+        }
+        
+        return false;
+    }
+
+    private static boolean isPointInPolygon(Point point, Polygon polygon) {
+        List<List<Point>> coordinates = polygon.coordinates();
+        if (coordinates.isEmpty()) {
+            return false;
+        }
+
+        List<Point> outerRing = coordinates.get(0);
+        boolean inside = false;
+        int n = outerRing.size();
+        for (int i = 0, j = n - 1; i < n; j = i++) {
+            double xi = outerRing.get(i).longitude(), yi = outerRing.get(i).latitude();
+            double xj = outerRing.get(j).longitude(), yj = outerRing.get(j).latitude();
+
+            boolean intersect = ((yi > point.latitude()) != (yj > point.latitude())) &&
+                                (point.longitude() < (xj - xi) * (point.latitude() - yi) / (yj - yi) + xi);
+            if (intersect) {
+                inside = !inside;
+            }
+        }
+
+        return inside;
+    }
+
+    private static Point findNearestPoint(Graph<Point, DefaultWeightedEdge> graph, Point target, double maxDistanceKm) {
+        Point nearestPoint = null;
+        double minDistance = Double.MAX_VALUE;
+
+        for (Point vertex : graph.vertexSet()) {
+            double distance = haversineDistance(
+                vertex.latitude(), vertex.longitude(),
+                target.latitude(), target.longitude()
+            );
+
+            if (distance < minDistance && distance <= maxDistanceKm) {
+                minDistance = distance;
+                nearestPoint = vertex;
+            }
+        }
+
+        return nearestPoint;
+    }
+
+    private static double haversineDistance(double lat1, double lon1, double lat2, double lon2) {
+        final double R = 6371; // Radius of the Earth in kilometers
+
+        double latDistance = Math.toRadians(lat2 - lat1);
+        double lonDistance = Math.toRadians(lon2 - lon1);
+
+        lat1 = Math.toRadians(lat1);
+        lat2 = Math.toRadians(lat2);
+
+        double a = 
+            Math.pow(Math.sin(latDistance / 2), 2) +
+            Math.pow(Math.sin(lonDistance / 2), 2) *
+            Math.cos(lat1) *
+            Math.cos(lat2);
+
+        double c = 2 * Math.asin(Math.sqrt(a));
+        return R * c;
     }
 }
