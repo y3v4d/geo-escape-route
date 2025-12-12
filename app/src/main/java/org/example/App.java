@@ -1,28 +1,22 @@
 package org.example;
 
-import java.net.URLEncoder;
-import java.nio.charset.StandardCharsets;
-
 import org.example.geo.FloodZoneLoader;
 import org.example.geo.GeoBuilder;
 import org.example.geo.RoadNetworkLoader;
 import org.example.graph.GraphBuilder;
 import org.example.graph.PathFinder;
 import org.example.utils.FileIO;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import com.mapbox.geojson.FeatureCollection;
 import com.mapbox.geojson.Point;
 
+import io.javalin.Javalin;
+
 public class App {
+    private final static Logger logger = LoggerFactory.getLogger(App.class);
+
     public static void main(String[] args) throws Exception {
-        double startLon = 21.7643873;
-        double startLat = 49.6833371;
-        double endLon = 21.7602742;
-        double endLat = 49.6853010;
-
-        Point startPoint = Point.fromLngLat(startLon, startLat);
-        Point endPoint = Point.fromLngLat(endLon, endLat);
-
         String roadsJson = FileIO.loadResource("roads.geojson");
         String floodZonesJson = FileIO.loadResource("flood_zones.geojson");
 
@@ -34,40 +28,72 @@ public class App {
 
         var graph = GraphBuilder.buildGraph(roadLines, floodZones);
 
-        var nearestStart = PathFinder.findNearestPoint(graph, startPoint, 0.05);
-        var nearestEnd = PathFinder.findNearestPoint(graph, endPoint, 0.05);
+        Javalin app = Javalin.create(config -> {
+            config.bundledPlugins.enableCors(cors -> {
+                cors.addRule(rule -> {
+                    rule.anyHost();
+                });
+            });
+        }).start(3001);
 
-        var path = PathFinder.findShortestPath(graph, nearestStart, nearestEnd);
-        if (path != null) {
-            System.out.println("Shortest path distance: " + path.getWeight() + " km");
-            System.out.println("Shortest path: " + path.getVertexList());
+        app.get("/api/evac", ctx -> {
+            String startParam = ctx.queryParam("start");
+            String endParam = ctx.queryParam("end");
+            String fullParam = ctx.queryParam("full");
 
-            var finalVisualization = GeoBuilder.buildFinalVisualization(
-                roadLines,
-                floodZones,
-                path.getVertexList()
-            );
+            if(startParam == null || endParam == null) {
+                ctx.status(400).result("Missing 'start' or 'end' query parameters.");
+                return;
+            }
 
-            String url = generateGeojsonIOURL(finalVisualization);
-            openWithBrowser(url);
-        } else {
-            System.out.println("No path found between the points.");
-        }
+            Point startPoint, endPoint;
+            try {
+                startPoint = parsePoint(startParam);
+                endPoint = parsePoint(endParam);
+            } catch (IllegalArgumentException e) {
+                ctx.status(400).result("Invalid coordinate format. Expected 'lon,lat'");
+                return;
+            }
+
+            var nearestStart = PathFinder.findNearestPoint(graph, startPoint, 0.05);
+            var nearestEnd = PathFinder.findNearestPoint(graph, endPoint, 0.05);
+            if(nearestStart == null || nearestEnd == null) {
+                ctx.status(404).result("No nearby road points found within 50 meters.");
+                return;
+            }
+
+            var path = PathFinder.findShortestPath(graph, nearestStart, nearestEnd);
+            if (path == null) {
+                ctx.status(404).result("No path found between the points.");
+                return;
+            }
+
+            if(fullParam != null) {
+                var fullFC = GeoBuilder.buildFinalVisualization(
+                    roadLines,
+                    floodZones,
+                    path.getVertexList()
+                );
+
+                ctx.contentType("application/json").result(fullFC.toJson());
+            } else {
+                var pathFC = GeoBuilder.buildFromGraphPath(path);
+                ctx.contentType("application/json").result(pathFC.toJson());
+            }
+        });
+
+        logger.info("Server started at http://localhost:3001");
     }
 
-    private static String generateGeojsonIOURL(FeatureCollection featureCollection) {
-        String encodedGeojson = URLEncoder.encode(featureCollection.toJson(), StandardCharsets.UTF_8);
-        String url = "http://geojson.io/#data=data:application/json," + encodedGeojson;
-
-        return url;
-    }
-
-    private static void openWithBrowser(String url) throws Exception {
-        if (java.awt.Desktop.isDesktopSupported()) {
-            java.awt.Desktop desktop = java.awt.Desktop.getDesktop();
-            desktop.browse(new java.net.URI(url));
-        } else {
-            System.out.println("Desktop is not supported.");
+    private static Point parsePoint(String coordString) {
+        String[] parts = coordString.split(",");
+        if (parts.length != 2) {
+            throw new IllegalArgumentException("Invalid coordinate format. Expected 'lon,lat'");
         }
+
+        double lon = Double.parseDouble(parts[0]);
+        double lat = Double.parseDouble(parts[1]);
+
+        return Point.fromLngLat(lon, lat);
     }
 }
