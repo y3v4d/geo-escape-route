@@ -10,5 +10,15 @@ plugins {
     id("org.gradle.toolchains.foojay-resolver-convention") version "1.0.0"
 }
 
+dependencyResolutionManagement {
+    repositories {
+        mavenCentral()
+        
+        maven {
+            url = uri("https://api.mapbox.com/downloads/v2/releases/maven")
+        }
+    }
+}
+
 rootProject.name = "geo-escape-route"
 include("app")

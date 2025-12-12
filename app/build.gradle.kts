@@ -8,11 +8,12 @@
 plugins {
     // Apply the application plugin to add support for building a CLI application in Java.
     application
+    id("com.gradleup.shadow") version "9.3.0"
 }
 
 repositories {
     // Use Maven Central for resolving dependencies.
-    mavenCentral()
+    
 }
 
 dependencies {
@@ -23,18 +24,35 @@ dependencies {
 
     // This dependency is used by the application.
     implementation(libs.guava)
+
+    implementation("com.mapbox.mapboxsdk:mapbox-sdk-geojson:7.9.0")
+    implementation("org.jgrapht:jgrapht-core:1.5.2")
+    implementation("org.slf4j:slf4j-simple:2.0.10")
+    implementation("io.javalin:javalin:6.1.3")
 }
 
 // Apply a specific Java toolchain to ease working on different environments.
 java {
     toolchain {
-        languageVersion = JavaLanguageVersion.of(25)
+        languageVersion = JavaLanguageVersion.of(17)
     }
 }
 
 application {
     // Define the main class for the application.
     mainClass = "org.example.App"
+}
+
+tasks.shadowJar {
+    archiveBaseName.set("geo-escape-route")
+    archiveClassifier.set("")
+    archiveVersion.set("1.0.0")
+}
+
+tasks.jar {
+    manifest {
+        attributes["Main-Class"] = application.mainClass
+    }
 }
 
 tasks.named<Test>("test") {
